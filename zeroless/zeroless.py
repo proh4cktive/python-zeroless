@@ -7,6 +7,7 @@ A global Logger object. To use it, just add an Handler object
 and set an appropriate logging level.
 """
 
+import os
 import zmq
 import logging
 
@@ -17,6 +18,13 @@ from functools import partial
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
+
+def touch(path):
+    basedir = os.path.dirname(path)
+    if not os.path.exists(basedir):
+        os.makedirs(basedir)
+    with open(path, 'a'):
+        os.utime(path, None)
 
 def _check_valid_port_range(port):
     if port < 1024 or port > 65535:
@@ -31,9 +39,21 @@ def _check_valid_num_connections(socket_type, num_connections):
         log.error(error)
         raise RuntimeError(error)
 
+def _check_valid_file(name):
+    # Check if file exists
+    if not os.path.exists(name):
+        try:
+            touch(name)
+        except Exception as err:
+            raise ValueError(err)
+
 def _connect_zmq_sock(sock, ip, port):
     log.info('Connecting to {0} on port {1}'.format(ip, port))
     sock.connect('tcp://' + ip + ':' + str(port))
+
+def _connect_zmq_file(sock, name):
+    log.info('Connecting to IPC using file {0}'.format(name))
+    sock.connect('ipc:///' + name)
 
 def _disconnect_zmq_sock(sock, ip, port):
     log.info('Disconnecting from {0} on port {1}'.format(ip, port))
@@ -45,19 +65,37 @@ def _disconnect_zmq_sock(sock, ip, port):
         log.exception(error)
         raise ValueError(error)
 
-def _bind_zmq_sock(sock, port):
-    log.info('Binding on port {0}'.format(port))
+def _disconnect_zmq_file(sock, name):
+    log.info('Disconnecting from IPC file {0}'.format(name))
 
     try:
-        if port:
-            sock.bind('tcp://*:' + str(port))
-            return port
-        else:
-            return sock.bind_to_random_port('tcp://*')
+        sock.disconnect('ipc:///' + name)
     except zmq.ZMQError:
-        error = 'Port {0} is already in use'.format(port)
+        error = 'There was no connection on IPC file {0}'.format(name)
         log.exception(error)
         raise ValueError(error)
+
+def _bind_zmq_sock(sock, ip='*', port=None, ipc=False):
+    if ipc:
+        log.info('Binding on file {0}'.format(ip))
+        try:
+            sock.bind('ipc:///' + ip)
+        except zmq.ZMQError:
+            error = 'File {0} not usable'.format(ip)
+            log.exception(error)
+            raise ValueError(error)
+    else:
+        log.info('Binding on {0}:{1}'.format(ip, port))
+        try:
+            if port:
+                sock.bind('tcp://' + ip + ':' + str(port))
+                return port
+            else:
+                return sock.bind_to_random_port('tcp://' + ip)
+        except zmq.ZMQError:
+            error = 'Port {0} is already in use'.format(port)
+            log.exception(error)
+            raise ValueError(error)
 
 def _recv(sock):
     while True:
@@ -254,7 +292,10 @@ class Client(Sock):
                                      len(self._addresses))
 
         for ip, port in self._addresses:
-            _connect_zmq_sock(self._sock, ip, port)
+            if port == 0:
+                _connect_zmq_file(self._sock, ip)
+            else:
+                _connect_zmq_sock(self._sock, ip, port)
 
     @property
     def addresses(self):
@@ -266,7 +307,7 @@ class Client(Sock):
         """
         return tuple(self._addresses)
 
-    def connect(self, ip, port):
+    def connect(self, ip, port, ipc=False):
         """
         Connects to a server at the specified ip and port.
 
@@ -276,7 +317,11 @@ class Client(Sock):
         :type port: int
         :rtype: self
         """
-        _check_valid_port_range(port)
+        if ipc:
+            # On IPC flag, ip is a file path
+            _check_valid_file(ip)
+        else:
+            _check_valid_port_range(port)
 
         address = (ip, port)
 
@@ -291,7 +336,10 @@ class Client(Sock):
             _check_valid_num_connections(self._sock.socket_type,
                                          len(self._addresses))
 
-            _connect_zmq_sock(self._sock, ip, port)
+            if ipc:
+                _connect_zmq_file(self._sock, ip)
+            else:
+                _connect_zmq_sock(self._sock, ip, port)
 
         return self
 
@@ -305,7 +353,20 @@ class Client(Sock):
         """
         return self.connect('127.0.0.1', port)
 
-    def disconnect(self, ip, port):
+    def connect_file(self, name):
+        """
+        Connects to a server in IPC using specific socket file name.
+
+        :param name: path name used as socket file
+        :type port: str
+        :rtype: self
+        """
+        _check_valid_file(name)
+
+        # Stay compliant with existing list
+        return self.connect(name, 0, ipc=True)
+
+    def disconnect(self, ip, port, ipc=False):
         """
         Disconnects from a server at the specified ip and port.
 
@@ -315,7 +376,8 @@ class Client(Sock):
         :type port: int
         :rtype: self
         """
-        _check_valid_port_range(port)
+        if not ipc:
+            _check_valid_port_range(port)
         address = (ip, port)
 
         try:
@@ -326,7 +388,10 @@ class Client(Sock):
             raise ValueError(error)
 
         if self._is_ready:
-            _disconnect_zmq_sock(self._sock, ip, port)
+            if ipc:
+                _disconnect_zmq_file(self._sock, ip)
+            else:
+                _disconnect_zmq_sock(self._sock, ip, port)
 
         return self
 
@@ -340,6 +405,16 @@ class Client(Sock):
         """
         return self.disconnect('127.0.0.1', port)
 
+    def disconnect_file(self, name):
+        """
+        Disconnects from a server in IPC using specific socket file name.
+
+        :param name: path name used as socket file
+        :type name: str
+        :rtype: self
+        """
+        return self.disconnect(name, 0, ipc=True)
+
     def disconnect_all(self):
         """
         Disconnects from all connected servers.
@@ -348,7 +423,8 @@ class Client(Sock):
         addresses = deepcopy(self._addresses)
 
         for ip, port in addresses:
-            self.disconnect(ip, port)
+            ipc = True if port == 0 else False
+            self.disconnect(ip, port, ipc=ipc)
 
         return self
 
@@ -356,7 +432,7 @@ class Server(Sock):
     """
     A server that clients can connect to.
     """
-    def __init__(self, port):
+    def __init__(self, ip="127.0.0.1", port=None, name=None):
         """
         Constructor of the Server.
 
@@ -365,10 +441,19 @@ class Server(Sock):
         actual value for the port will be available only after the binding
         :type port: int
         """
+        if name:
+            self._ip = name
+            self._ipc = True
+            _check_valid_file(name)
+        else:
+            self._ip = ip
+            self._ipc = False
+
         if port:
             _check_valid_port_range(port)
+        
         self._port = port
-
+        
         Sock.__init__(self)
 
     def _setup(self, sock):
@@ -379,7 +464,10 @@ class Server(Sock):
             warning += 'is not an option'
             warn(warning)
 
-        self._port = _bind_zmq_sock(sock, self._port)
+        if self._ipc:
+            self._port = _bind_zmq_sock(sock, ip=self._ip, ipc=True)
+        else:
+            self._port = _bind_zmq_sock(sock, ip=self._ip, port=self._port)
 
     @property
     def port(self):
@@ -389,3 +477,13 @@ class Server(Sock):
         :rtype: int
         """
         return self._port
+
+    @property
+    def ip(self):
+        """
+        Returns the ip or file name for ipc.
+
+        :rtype: str
+        """
+        return self._ip
+    

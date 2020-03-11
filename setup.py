@@ -48,6 +48,7 @@ setup(name='zeroless',
       packages=['zeroless', 'zeroless_helpers'],
       install_requires=[
           'pyzmq',
+          'netaddr'
       ],
       cmdclass = {'test': Pytest},
       tests_require=['pytest'],
